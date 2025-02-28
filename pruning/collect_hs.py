@@ -1,25 +1,24 @@
-from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 import torch.nn.functional as F
-from datasets import load_dataset
 import json
-from tqdm import tqdm
 import argparse
-from sentence_transformers import SentenceTransformer, util
 import random
-import torch
 import numpy as np
-from torch.utils.data import Dataset
-from sklearn.manifold import TSNE
-from sklearn.cluster import KMeans
 import os
 import matplotlib.pyplot as plt
 import warnings
+import math
 
 import sys
-import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from datasets import load_dataset
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from tqdm import tqdm
+from sentence_transformers import SentenceTransformer, util
+from torch.utils.data import Dataset
+from sklearn.manifold import TSNE
+from sklearn.cluster import KMeans
 from utils.qa_dataset import QADataset
 
 def set_seed(seed: int = 42):
@@ -297,7 +296,13 @@ def main(args):
     # ======================================== #
     model_name = args.model_name
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(model_name, load_in_8bit=False)
+
+    is_8bit = True
+    if model_name in ["facebook/opt-30b", "facebook/opt-13b", "meta-llama/Llama-3.1-8B", "meta-llama/Llama-3.2-11B-Vision"]:
+        model = AutoModelForCausalLM.from_pretrained(model_name, load_in_8bit=True)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(model_name, load_in_8bit=False)
+        is_8bit = False
     st_model = SentenceTransformer("all-MiniLM-L6-v2")
 
     # Load the dataset
@@ -331,21 +336,41 @@ def main(args):
             continue
 
         last_hidden_state = get_last_hidden_state(model, tokenizer, question)
+        logits = get_averaged_logits(question, answer_choices[correct_answer_idx], tokenizer, model)
+        logits_tensor = torch.tensor(logits)
+
+        probs = F.softmax(logits_tensor, dim=0)
+        topk = torch.topk(probs, 2)
+        vocab_size = probs.size(0)
+
+        # Track properties of probability distribution
+        shannon_entropy = -torch.sum(probs * torch.log(probs)).item()
+        max_softmax_probability = torch.max(probs).item()
+        prediction_margin = (topk.values[0] - topk.values[1]).item()
+        perplexity = math.exp(shannon_entropy)
+        logits_variance = torch.var(logits_tensor).item()
+        kl_divergence_uniform = torch.sum(probs * torch.log(probs * vocab_size)).item()
+
         results.append({
             "question": question,
             "answer_choices": answer_choices,
             "choice_probs": choice_probs,
             "best_answer": best_answer,
             "acc": acc,
+            "shannon_entropy": shannon_entropy,
+            "max_softmax_probability": max_softmax_probability,
+            "prediction_margin": prediction_margin,
+            "perplexity": perplexity,
+            "logits_variance": logits_variance,
+            "kl_divergence_uniform": kl_divergence_uniform,
             "last_hidden_state": last_hidden_state,
         })
 
-        logits = get_averaged_logits(question, answer_choices[correct_answer_idx], tokenizer, model)
-        all_logits.append(torch.tensor(logits))
+
+    all_logits.append(logits_tensor)
 
     all_logits = torch.stack(all_logits)
 
-    print(args.model_name)
     question_ngram_matrix = compute_ngram_similarity(questions)
     question_similarity_matrix = compute_pairwise_cos_similarity(torch.tensor(question_embeddings))
     logits_similarity_matrix = compute_pairwise_cos_similarity(all_logits)
@@ -356,7 +381,29 @@ def main(args):
     combined_kl_matrix = question_similarity_matrix * logits_kl_matrix
     combined_js_matrix = question_similarity_matrix * logits_js_matrix
 
+    matrix_save_dir = "saved_matrices/"
+    os.makedirs(matrix_save_dir, exist_ok=True)
+
+    # List of matrices and their corresponding names
+    matrices_dict = {
+        "question_ngram_matrix": question_ngram_matrix,
+        "question_similarity_matrix": question_similarity_matrix,
+        "logits_similarity_matrix": logits_similarity_matrix,
+        "logits_kl_matrix": logits_kl_matrix,
+        "logits_js_matrix": logits_js_matrix,
+        "combined_similarity_matrix": combined_similarity_matrix,
+        "combined_kl_matrix": combined_kl_matrix,
+        "combined_js_matrix": combined_js_matrix
+    }
+
+    # Save each matrix as a NumPy array
+    for name, matrix in matrices_dict.items():
+        name = args.dataset.split("/")[-1].replace(".json", "").strip() + args.model_name.split("/")[-1].strip() + "_" + name
+        np.save(os.path.join(matrix_save_dir, f"{name}.npy"), matrix.cpu().numpy())  # Move to CPU before saving if using GPU
+
+
     print("MODEL:", args.model_name)
+    print(f"8 bit: {str(is_8bit)}")
     print("TASK: ", args.dataset)
     names = ["NS","ES","LS","KL","JS","ELS","EKL","EJS"]
     matrices = [
